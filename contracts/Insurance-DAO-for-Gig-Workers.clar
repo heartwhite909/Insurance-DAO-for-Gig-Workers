@@ -10,11 +10,20 @@
 (define-constant ERR_ALREADY_VOTED (err u108))
 (define-constant ERR_CLAIM_NOT_APPROVED (err u109))
 (define-constant ERR_CLAIM_ALREADY_PAID (err u110))
+(define-constant ERR_STREAK_NOT_FOUND (err u200))
+(define-constant ERR_STREAK_ALREADY_EXISTS (err u201))
+(define-constant STREAK_BONUS_THRESHOLD u3)
+(define-constant STREAK_BONUS_MULTIPLIER u2)
+(define-constant CONTRIBUTION_WINDOW u1008)
+
+
 
 (define-data-var total-pool uint u0)
 (define-data-var member-count uint u0)
 (define-data-var claim-counter uint u0)
 (define-data-var min-contribution uint u1000000)
+(define-data-var total-active-streaks uint u0)
+(define-data-var highest-streak uint u0)
 
 (define-map members
   principal
@@ -236,5 +245,110 @@
   (match (map-get? members member)
     member-data (calculate-voting-power (get total-contributed member-data))
     u0
+  )
+)
+
+(define-map contribution-streaks
+  principal
+  {
+    current-streak: uint,
+    longest-streak: uint,
+    last-contribution-block: uint,
+    streak-start-block: uint,
+    bonus-voting-power: uint
+  }
+)
+
+(define-map streak-leaderboard
+  uint
+  { member: principal, streak: uint }
+)
+
+(define-public (initialize-streak (member principal))
+  (let
+    (
+      (existing-streak (map-get? contribution-streaks member))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-none existing-streak) ERR_STREAK_ALREADY_EXISTS)
+    (map-set contribution-streaks member {
+      current-streak: u1,
+      longest-streak: u1,
+      last-contribution-block: current-block,
+      streak-start-block: current-block,
+      bonus-voting-power: u0
+    })
+    (var-set total-active-streaks (+ (var-get total-active-streaks) u1))
+    (ok true)
+  )
+)
+
+(define-public (update-streak (member principal))
+  (let
+    (
+      (streak-data (unwrap! (map-get? contribution-streaks member) ERR_STREAK_NOT_FOUND))
+      (current-block stacks-block-height)
+      (blocks-since-last (- current-block (get last-contribution-block streak-data)))
+      (new-streak (if (<= blocks-since-last CONTRIBUTION_WINDOW)
+                    (+ (get current-streak streak-data) u1)
+                    u1))
+      (new-longest (if (> new-streak (get longest-streak streak-data))
+                     new-streak
+                     (get longest-streak streak-data)))
+      (bonus-power (if (>= new-streak STREAK_BONUS_THRESHOLD)
+                     (* (/ new-streak STREAK_BONUS_THRESHOLD) STREAK_BONUS_MULTIPLIER)
+                     u0))
+    )
+    (map-set contribution-streaks member {
+      current-streak: new-streak,
+      longest-streak: new-longest,
+      last-contribution-block: current-block,
+      streak-start-block: (if (is-eq new-streak u1) current-block (get streak-start-block streak-data)),
+      bonus-voting-power: bonus-power
+    })
+    (if (> new-streak (var-get highest-streak))
+      (var-set highest-streak new-streak)
+      true
+    )
+    (ok new-streak)
+  )
+)
+
+(define-read-only (get-streak-info (member principal))
+  (map-get? contribution-streaks member)
+)
+
+(define-read-only (get-streak-bonus (member principal))
+  (match (map-get? contribution-streaks member)
+    streak-data (get bonus-voting-power streak-data)
+    u0
+  )
+)
+
+(define-read-only (get-enhanced-voting-power (member principal) (base-power uint))
+  (let
+    (
+      (streak-bonus (get-streak-bonus member))
+    )
+    (+ base-power streak-bonus)
+  )
+)
+
+(define-read-only (get-streak-stats)
+  {
+    total-active-streaks: (var-get total-active-streaks),
+    highest-streak: (var-get highest-streak)
+  }
+)
+
+(define-read-only (is-streak-active (member principal))
+  (match (map-get? contribution-streaks member)
+    streak-data (let
+      (
+        (blocks-since-last (- stacks-block-height (get last-contribution-block streak-data)))
+      )
+      (<= blocks-since-last CONTRIBUTION_WINDOW)
+    )
+    false
   )
 )
