@@ -16,6 +16,12 @@
 (define-constant STREAK_BONUS_MULTIPLIER u2)
 (define-constant CONTRIBUTION_WINDOW u1008)
 
+(define-constant REPUTATION_GOOD_VOTE u10)
+(define-constant REPUTATION_BAD_VOTE u5)
+(define-constant REPUTATION_DECAY_RATE u2)
+(define-constant REPUTATION_DECAY_BLOCKS u4320)
+(define-constant MAX_REPUTATION u1000)
+(define-constant MIN_REPUTATION u0)
 
 
 (define-data-var total-pool uint u0)
@@ -352,3 +358,98 @@
     false
   )
 )
+
+(define-map member-reputation
+  principal
+  {
+    current-score: uint,
+    total-votes: uint,
+    correct-votes: uint,
+    last-decay-block: uint,
+    reputation-tier: uint
+  }
+)
+
+(define-public (initialize-reputation (member principal))
+  (let
+    (
+      (existing-rep (map-get? member-reputation member))
+    )
+    (if (is-none existing-rep)
+      (begin
+        (map-set member-reputation member {
+          current-score: u100,
+          total-votes: u0,
+          correct-votes: u0,
+          last-decay-block: stacks-block-height,
+          reputation-tier: u1
+        })
+        (ok true)
+      )
+      (ok false)
+    )
+  )
+)
+
+(define-public (update-vote-reputation (voter principal) (claim-id uint) (was-correct bool))
+  (let
+    (
+      (rep-data (unwrap! (map-get? member-reputation voter) (err u404)))
+      (score-change (if was-correct REPUTATION_GOOD_VOTE (- u0 REPUTATION_BAD_VOTE)))
+      (new-score (+ (get current-score rep-data) score-change))
+      (capped-score (if (> new-score MAX_REPUTATION) MAX_REPUTATION 
+                      (if (< new-score MIN_REPUTATION) MIN_REPUTATION new-score)))
+      (new-tier (calculate-reputation-tier capped-score))
+    )
+    (map-set member-reputation voter {
+      current-score: capped-score,
+      total-votes: (+ (get total-votes rep-data) u1),
+      correct-votes: (if was-correct (+ (get correct-votes rep-data) u1) (get correct-votes rep-data)),
+      last-decay-block: (get last-decay-block rep-data),
+      reputation-tier: new-tier
+    })
+    (ok capped-score)
+  )
+)
+
+(define-public (apply-reputation-decay (member principal))
+  (let
+    (
+      (rep-data (unwrap! (map-get? member-reputation member) (err u404)))
+      (blocks-passed (- stacks-block-height (get last-decay-block rep-data)))
+      (decay-periods (/ blocks-passed REPUTATION_DECAY_BLOCKS))
+    )
+    (if (> decay-periods u0)
+      (let
+        (
+          (decay-amount (* decay-periods REPUTATION_DECAY_RATE))
+          (new-score (if (> (get current-score rep-data) decay-amount)
+                       (- (get current-score rep-data) decay-amount)
+                       MIN_REPUTATION))
+          (new-tier (calculate-reputation-tier new-score))
+        )
+        (map-set member-reputation member (merge rep-data {
+          current-score: new-score,
+          last-decay-block: stacks-block-height,
+          reputation-tier: new-tier
+        }))
+        (ok new-score)
+      )
+      (ok (get current-score rep-data))
+    )
+  )
+)
+
+(define-read-only (calculate-reputation-tier (score uint))
+  (if (>= score u800) u5
+    (if (>= score u600) u4
+      (if (>= score u400) u3
+        (if (>= score u200) u2 u1)))))
+
+(define-read-only (get-reputation-info (member principal))
+  (map-get? member-reputation member))
+
+(define-read-only (get-reputation-multiplier (member principal))
+  (match (map-get? member-reputation member)
+    rep-data (get reputation-tier rep-data)
+    u1))
