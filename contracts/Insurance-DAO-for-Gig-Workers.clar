@@ -23,6 +23,15 @@
 (define-constant MAX_REPUTATION u1000)
 (define-constant MIN_REPUTATION u0)
 
+(define-constant EMERGENCY_RESERVE_PERCENTAGE u10)
+(define-constant EMERGENCY_THRESHOLD_PERCENTAGE u20)
+(define-constant ERR_EMERGENCY_NOT_TRIGGERED (err u300))
+(define-constant ERR_INSUFFICIENT_RESERVE (err u301))
+
+(define-data-var emergency-reserve uint u0)
+(define-data-var reserve-activated bool false)
+(define-data-var emergency-withdrawals uint u0)
+
 
 (define-data-var total-pool uint u0)
 (define-data-var member-count uint u0)
@@ -453,3 +462,93 @@
   (match (map-get? member-reputation member)
     rep-data (get reputation-tier rep-data)
     u1))
+
+
+(define-map emergency-access-log
+  uint
+  {
+    timestamp: uint,
+    amount: uint,
+    main-pool-balance: uint,
+    authorized-by: principal
+  }
+)
+
+(define-public (fund-emergency-reserve (contribution-amount uint))
+  (let
+    (
+      (reserve-contribution (/ (* contribution-amount EMERGENCY_RESERVE_PERCENTAGE) u100))
+    )
+    (var-set emergency-reserve (+ (var-get emergency-reserve) reserve-contribution))
+    (ok reserve-contribution)
+  )
+)
+
+(define-public (trigger-emergency-access)
+  (let
+    (
+      (current-pool (var-get total-pool))
+      (total-contributions (* (var-get member-count) (var-get min-contribution)))
+      (emergency-threshold (/ (* total-contributions EMERGENCY_THRESHOLD_PERCENTAGE) u100))
+    )
+    (asserts! (<= current-pool emergency-threshold) ERR_EMERGENCY_NOT_TRIGGERED)
+    (var-set reserve-activated true)
+    (ok true)
+  )
+)
+
+(define-public (emergency-withdraw (amount uint))
+  (let
+    (
+      (withdrawal-id (+ (var-get emergency-withdrawals) u1))
+    )
+    (asserts! (var-get reserve-activated) ERR_EMERGENCY_NOT_TRIGGERED)
+    (asserts! (>= (var-get emergency-reserve) amount) ERR_INSUFFICIENT_RESERVE)
+    (var-set emergency-reserve (- (var-get emergency-reserve) amount))
+    (var-set total-pool (+ (var-get total-pool) amount))
+    (var-set emergency-withdrawals withdrawal-id)
+    (map-set emergency-access-log withdrawal-id {
+      timestamp: stacks-block-height,
+      amount: amount,
+      main-pool-balance: (var-get total-pool),
+      authorized-by: tx-sender
+    })
+    (ok amount)
+  )
+)
+
+(define-public (deactivate-emergency-access)
+  (let
+    (
+      (current-pool (var-get total-pool))
+      (safe-threshold (/ (* (var-get member-count) (var-get min-contribution) u50) u100))
+    )
+    (asserts! (>= current-pool safe-threshold) ERR_EMERGENCY_NOT_TRIGGERED)
+    (var-set reserve-activated false)
+    (ok true)
+  )
+)
+
+(define-read-only (get-emergency-status)
+  {
+    reserve-balance: (var-get emergency-reserve),
+    is-activated: (var-get reserve-activated),
+    total-emergency-withdrawals: (var-get emergency-withdrawals),
+    emergency-threshold: (/ (* (* (var-get member-count) (var-get min-contribution)) EMERGENCY_THRESHOLD_PERCENTAGE) u100)
+  }
+)
+
+(define-read-only (get-emergency-withdrawal-log (withdrawal-id uint))
+  (map-get? emergency-access-log withdrawal-id)
+)
+
+(define-read-only (calculate-reserve-health)
+  (let
+    (
+      (reserve-balance (var-get emergency-reserve))
+      (recommended-reserve (/ (* (var-get total-pool) u15) u100))
+    )
+    (if (>= reserve-balance recommended-reserve) u100
+      (/ (* reserve-balance u100) recommended-reserve))
+  )
+)
