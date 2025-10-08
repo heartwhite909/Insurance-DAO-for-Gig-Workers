@@ -28,6 +28,13 @@
 (define-constant ERR_EMERGENCY_NOT_TRIGGERED (err u300))
 (define-constant ERR_INSUFFICIENT_RESERVE (err u301))
 
+(define-constant REFERRAL_REWARD_PERCENTAGE u5)
+(define-constant MAX_REFERRAL_DEPTH u3)
+(define-constant ERR_INVALID_REFERRER (err u400))
+(define-constant ERR_SELF_REFERRAL (err u401))
+
+(define-data-var total-referral-rewards uint u0)
+
 (define-data-var emergency-reserve uint u0)
 (define-data-var reserve-activated bool false)
 (define-data-var emergency-withdrawals uint u0)
@@ -551,4 +558,78 @@
     (if (>= reserve-balance recommended-reserve) u100
       (/ (* reserve-balance u100) recommended-reserve))
   )
+)
+
+(define-map member-referrals
+  principal
+  {
+    referrer: (optional principal),
+    total-referred: uint,
+    referral-earnings: uint,
+    referral-bonus-power: uint
+  }
+)
+
+(define-public (join-dao-with-referral (contribution uint) (referrer (optional principal)))
+  (let
+    (
+      (sender tx-sender)
+      (current-member (map-get? members sender))
+    )
+    (asserts! (>= contribution (var-get min-contribution)) ERR_INVALID_AMOUNT)
+    (asserts! (is-none current-member) ERR_ALREADY_MEMBER)
+    (match referrer
+      ref-principal 
+        (begin
+          (asserts! (not (is-eq sender ref-principal)) ERR_SELF_REFERRAL)
+          (asserts! (is-some (map-get? members ref-principal)) ERR_INVALID_REFERRER)
+          (unwrap-panic (process-referral-reward ref-principal contribution))
+        )
+      u0
+    )
+      (try! (stx-transfer? contribution sender (as-contract tx-sender)))
+    (map-set members sender {
+      total-contributed: contribution,
+      join-block: stacks-block-height,
+      active: true
+    })
+    (map-set member-referrals sender {
+      referrer: referrer,
+      total-referred: u0,
+      referral-earnings: u0,
+      referral-bonus-power: u0
+    })
+    (var-set total-pool (+ (var-get total-pool) contribution))
+    (var-set member-count (+ (var-get member-count) u1))
+    (ok true)
+  )
+)
+
+(define-private (process-referral-reward (referrer-address principal) (contribution uint))
+  (let
+    (
+      (reward-amount (/ (* contribution REFERRAL_REWARD_PERCENTAGE) u100))
+      (referrer-data (unwrap! (map-get? member-referrals referrer-address) ERR_INVALID_REFERRER))
+      (new-bonus-power (/ (+ (get total-referred referrer-data) u1) u3))
+    )
+    (try! (as-contract (stx-transfer? reward-amount tx-sender referrer-address)))
+    (map-set member-referrals referrer-address {
+      referrer: (get referrer referrer-data),
+      total-referred: (+ (get total-referred referrer-data) u1),
+      referral-earnings: (+ (get referral-earnings referrer-data) reward-amount),
+      referral-bonus-power: new-bonus-power
+    })
+    (var-set total-referral-rewards (+ (var-get total-referral-rewards) reward-amount))
+    (ok reward-amount)
+  )
+)
+
+(define-read-only (get-referral-info (member principal))
+  (map-get? member-referrals member)
+)
+
+(define-read-only (get-referral-stats)
+  {
+    total-rewards-distributed: (var-get total-referral-rewards)
+  }
 )
