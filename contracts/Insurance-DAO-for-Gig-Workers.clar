@@ -33,6 +33,15 @@
 (define-constant ERR_INVALID_REFERRER (err u400))
 (define-constant ERR_SELF_REFERRAL (err u401))
 
+(define-constant ERR_BOND_NOT_FOUND (err u500))
+(define-constant ERR_BOND_ACTIVE (err u501))
+(define-constant ERR_BOND_NOT_MATURED (err u502))
+(define-constant ERR_INVALID_LOCK_PERIOD (err u503))
+(define-constant EARLY_UNLOCK_PENALTY u20)
+
+(define-data-var total-bonded uint u0)
+(define-data-var bond-counter uint u0)
+
 (define-data-var total-referral-rewards uint u0)
 
 (define-data-var emergency-reserve uint u0)
@@ -632,4 +641,112 @@
   {
     total-rewards-distributed: (var-get total-referral-rewards)
   }
+)
+
+(define-map member-bonds
+  { member: principal, bond-id: uint }
+  {
+    amount: uint,
+    lock-period-blocks: uint,
+    start-block: uint,
+    maturity-block: uint,
+    bonus-multiplier: uint,
+    is-active: bool
+  }
+)
+
+(define-map member-bond-count
+  principal
+  { total-bonds: uint }
+)
+
+(define-public (lock-contribution (amount uint) (lock-period uint))
+  (let
+    (
+      (sender tx-sender)
+      (member-data (unwrap! (map-get? members sender) ERR_NOT_MEMBER))
+      (current-block stacks-block-height)
+      (bond-count (default-to { total-bonds: u0 } (map-get? member-bond-count sender)))
+      (new-bond-id (+ (get total-bonds bond-count) u1))
+      (blocks-in-period (match-lock-period lock-period))
+      (multiplier (calculate-bond-multiplier lock-period))
+    )
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (is-some (some blocks-in-period)) ERR_INVALID_LOCK_PERIOD)
+    (try! (stx-transfer? amount sender (as-contract tx-sender)))
+    (map-set member-bonds
+      { member: sender, bond-id: new-bond-id }
+      {
+        amount: amount,
+        lock-period-blocks: blocks-in-period,
+        start-block: current-block,
+        maturity-block: (+ current-block blocks-in-period),
+        bonus-multiplier: multiplier,
+        is-active: true
+      }
+    )
+    (map-set member-bond-count sender { total-bonds: new-bond-id })
+    (var-set total-bonded (+ (var-get total-bonded) amount))
+    (var-set bond-counter (+ (var-get bond-counter) u1))
+    (ok new-bond-id)
+  )
+)
+
+(define-public (unlock-bond (bond-id uint))
+  (let
+    (
+      (sender tx-sender)
+      (bond-data (unwrap! (map-get? member-bonds { member: sender, bond-id: bond-id }) ERR_BOND_NOT_FOUND))
+      (current-block stacks-block-height)
+      (is-matured (>= current-block (get maturity-block bond-data)))
+      (payout-amount (if is-matured
+                       (get amount bond-data)
+                       (- (get amount bond-data) (/ (* (get amount bond-data) EARLY_UNLOCK_PENALTY) u100))))
+    )
+    (asserts! (get is-active bond-data) ERR_BOND_NOT_FOUND)
+    (try! (as-contract (stx-transfer? payout-amount tx-sender sender)))
+    (map-set member-bonds
+      { member: sender, bond-id: bond-id }
+      (merge bond-data { is-active: false })
+    )
+    (var-set total-bonded (- (var-get total-bonded) (get amount bond-data)))
+    (ok payout-amount)
+  )
+)
+
+(define-read-only (get-bond-info (member principal) (bond-id uint))
+  (map-get? member-bonds { member: member, bond-id: bond-id })
+)
+
+(define-read-only (get-bond-voting-boost (member principal) (bond-id uint))
+  (match (map-get? member-bonds { member: member, bond-id: bond-id })
+    bond-data (if (get is-active bond-data) (get bonus-multiplier bond-data) u0)
+    u0
+  )
+)
+
+(define-read-only (is-bond-matured (member principal) (bond-id uint))
+  (match (map-get? member-bonds { member: member, bond-id: bond-id })
+    bond-data (>= stacks-block-height (get maturity-block bond-data))
+    false
+  )
+)
+
+(define-read-only (get-total-bonded-stats)
+  {
+    total-bonded-amount: (var-get total-bonded),
+    total-bonds-created: (var-get bond-counter)
+  }
+)
+
+(define-private (match-lock-period (period uint))
+  (if (is-eq period u30) u4320
+    (if (is-eq period u90) u12960
+      (if (is-eq period u180) u25920 u0)))
+)
+
+(define-private (calculate-bond-multiplier (period uint))
+  (if (is-eq period u30) u1
+    (if (is-eq period u90) u2
+      (if (is-eq period u180) u3 u1)))
 )
